@@ -3,6 +3,7 @@ import re
 import math
 from random import choices
 
+
 class Spell_Checker:
     """The class implements a context sensitive spell checker. The corrections
         are done in the Noisy Channel framework, based on a language model and
@@ -19,6 +20,7 @@ class Spell_Checker:
         """
         self.lm = lm
         self.error_tables = None
+        self.count_table = None
 
     def build_model(self, text, n=3):
         """Returns a language model object built on the specified text. The language
@@ -78,6 +80,7 @@ class Spell_Checker:
                 error_tables (dict): a dictionary of error tables in the format
                 returned by  learn_error_tables()
         """
+        self.error_tables = error_tables
 
     def evaluate(self, text):
         """Returns the log-likelihod of the specified text given the language
@@ -90,6 +93,7 @@ class Spell_Checker:
                Float. The float should reflect the (log) probability.
         """
         return self.lm.evaluate(text)
+
     def spell_check(self, text, alpha):
         """ Returns the most probable fix for the specified text. Use a simple
             noisy channel model is the number of tokens in the specified text is
@@ -102,7 +106,41 @@ class Spell_Checker:
             Return:
                 A modified string (or a copy of the original if no corrections are made.)
         """
+        text = normalize_text(text)
+        words = text.split(' ')
+        max_sentence, max_prob = None, float('-inf')
 
+        for idx, word in enumerate(words):
+            optional_edits = self.get_word_edits(word)
+            for word, word_edit_prob in optional_edits:
+                new_sentence = words[:idx] + [word] + words[idx + 1:]
+                new_sentence_prob = self.calc_sentence_prob(new_sentence, math.log((1 - alpha) / word_edit_prob))
+                if new_sentence_prob > max_prob:
+                    max_sentence = new_sentence
+        original_sentence_prob = self.calc_sentence_prob(text, math.log(alpha))
+        if original_sentence_prob > max_prob:
+            max_sentence = text
+        return max_sentence
+
+    def calc_sentence_prob(self, sentence, channel_prob):
+        prior_sentence_prob = self.lm.evaluate(sentence)
+        return prior_sentence_prob + channel_prob
+
+    def get_word_edits(self, word):
+        letters = 'abcdefghijklmnopqrstuvwxyz'
+        splits = [(word[:i], word[i:]) for i in range(len(word) + 1)]
+        insertions = [[L + R[1:], self.calc_edit_prob('insertion', (L[-1] if L else '#') + R[0])] for L, R in splits if
+                      R]
+        transposes = [[L + R[1] + R[0] + R[2:], self.calc_edit_prob('transposition', R[0] + R[1])] for L, R in splits if
+                      len(R) > 1]
+        replaces = [[L + c + R[1:], self.calc_edit_prob('substitution', R[0] + c)] for L, R in splits if R for c in
+                    letters]
+        deletions = [[L + c + R, self.calc_edit_prob('deletion', (L[-1] if L else '#') + c)] for L, R in splits for c in
+                     letters]
+        return set(insertions + transposes + replaces + deletions)
+
+    def calc_edit_prob(self, err_type, err_letters):
+        pass
 
 def who_am_i():  # this is not a class method
     """Returns a ductionary with your name, id number and email. keys=['name', 'id','email']
