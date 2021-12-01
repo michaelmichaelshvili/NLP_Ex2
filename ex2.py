@@ -20,7 +20,11 @@ class Spell_Checker:
         """
         self.lm = lm
         self.error_tables = None
-        self.count_table = None
+        self.count_table = defaultdict(
+            int)  # dict. count the letters (singled and pairs) in the text the modek build from
+        self.vocabulary = set()  # the words n the text
+        if lm is not None:
+            self.update_from_lm()
 
     def build_model(self, text, n=3):
         """Returns a language model object built on the specified text. The language
@@ -46,6 +50,27 @@ class Spell_Checker:
                 lm: a language model object
         """
         self.lm = lm
+        self.update_from_lm()
+
+    def update_from_lm(self):
+        """
+        Build vocabulary and count table for one/two letters. I decided to use the lm.get_model_dictionary to build the
+        mentioned variables. Thereby, if we need to fix a word that not appear in the model, I consider this word as OOV.
+        """
+        self.vocabulary = set()
+        self.count_table = defaultdict(int)
+        for ngram, count in self.lm.get_model_dictionary().items():
+            words = ngram.split(' ')
+            for word in words:
+                self.vocabulary.add(word)
+            word = '#' + words[0]
+            if len(word) == 0:
+                continue
+            for l in range(len(word) - 1):
+                self.count_table[word[l]] += count
+                self.count_table[word[l:l + 2]] += count
+                if l == len(word) - 2:
+                    self.count_table[word[l + 1]] += count
 
     def learn_error_tables(self, errors_file):
         """Returns a nested dictionary {str:dict} where str is in:
@@ -71,6 +96,91 @@ class Spell_Checker:
         Returns:
             A dictionary of confusion "matrices" by error type (dict).
     """
+        lines = []
+        error_table = {'insertion': defaultdict(int), 'deletion': defaultdict(int), 'substitution': defaultdict(int),
+                       'transposition': defaultdict(int)}
+        with open(errors_file, 'r') as f:
+            lines = [line.rstrip().lower().split('\t') for line in f.readlines()]
+        err_type = None
+        for line in lines:
+            error, correct = line
+            if len(error) > len(correct):  # insertion error
+                err_type = 'insertion'
+                err_letters, err_count = self.get_insertion_deletion_error(correct, error)
+            elif len(error) < len(correct):  # deletion error
+                err_type = 'deletion'
+                err_letters, err_count = self.get_insertion_deletion_error(error, correct)
+            else:  # substitution or transportation
+                err_type, err_letters, err_count = self.get_trans_sub_error(error, correct)
+            for i in range(len(err_letters)):
+                error_table[err_type][err_letters[i]] = error_table[err_type].get(err_letters[i], 0) + err_count[i]
+        return error_table
+
+    def get_insertion_deletion_error(self, error, correct):
+        """
+        Find the error in the error word
+
+        Args:
+            error (str): the word we know is wrong
+            correct (str): the correct word
+        :return: the errors letters and count for each error
+        """
+        error_idx = None
+        for i in range(len(error)):
+            if error[i] != correct[i]:
+                error_idx = i
+                break
+        if error_idx is None:  # error in last letter
+            error_idx = len(correct) - 1
+        err_count = [1]
+        err_letters = []
+        prev_letter = '#' if error_idx == 0 else correct[error_idx - 1]
+        err_letters.append(prev_letter + correct[error_idx])
+        dup_once = False
+        for j in range(error_idx - 1, -1,
+                       -1):  # if the worng letter is in series of the same letter. e.g. employee against employeee
+            if correct[j] == correct[
+                j + 1]:  # as long as the current letter is like the worng letter, add 1 to error count
+                dup_once = True
+                if j - 1 >= 0 and correct[j] == correct[j - 1]:
+                    err_count[0] += 1
+                elif j == 0:
+                    err_letters.append('#' + correct[error_idx])
+                    err_count.append(1)
+            elif dup_once:  # only if there is at least one duplicate letter (employ*ee*) so 'ye' is also count as candidate mistake
+                err_letters.append(correct[j] + correct[error_idx])
+                err_count.append(1)
+                break
+            else:
+                break
+
+        return err_letters, err_count
+
+    def get_trans_sub_error(self, error, correct):
+        """
+        Find the incorrect letters. the possible errors are substitution and transposition
+        Args:
+            error (str): the word we know is wrong
+            correct (str): the correct word
+        :return: the errors letters and count for each error
+        :return:
+        """
+        error_idx = None
+        err_type = None
+        err_letters = None
+        for i in range(len(error) - 1):
+            if error[i] != correct[i]:
+                if error[i + 1] == correct[i] and correct[i + 1] == error[i]:  # check if there is cross
+                    err_type = 'transposition'
+                    err_letters = correct[i:i + 2]
+                else:
+                    err_type = 'substitution'
+                    err_letters = error[i] + correct[i]
+                break
+        if err_type is None:  # the error is substitution in last word
+            err_type = 'substitution'
+            err_letters = error[-1] + correct[-1]
+        return err_type, [err_letters], [1]
 
     def add_error_tables(self, error_tables):
         """ Adds the speficied dictionary of error tables as an instance variable.
@@ -108,39 +218,90 @@ class Spell_Checker:
         """
         text = normalize_text(text)
         words = text.split(' ')
+        words_to_fix = words
         max_sentence, max_prob = None, float('-inf')
-
-        for idx, word in enumerate(words):
+        new_words = None
+        for idx, word in enumerate(
+                words):  # if there are oov word, try fix only it (assumption there is only one error in sentence)
+            if word not in self.vocabulary:
+                new_words = [word]
+                oov_word_idx = idx
+                alpha = 1e-32
+                words_to_fix = new_words
+                break
+        for idx, word in enumerate(words_to_fix):
             optional_edits = self.get_word_edits(word)
             for word, word_edit_prob in optional_edits:
-                new_sentence = words[:idx] + [word] + words[idx + 1:]
-                new_sentence_prob = self.calc_sentence_prob(new_sentence, math.log((1 - alpha) / word_edit_prob))
+                if new_words is not None:
+                    new_sentence = words[:oov_word_idx] + [word] + words[oov_word_idx + 1:]
+                else:
+                    new_sentence = words[:idx] + [word] + words[idx + 1:]
+                new_sentence_prob = self.calc_sentence_prob(' '.join(new_sentence),
+                                                            math.log(1 - alpha) + math.log(word_edit_prob))
                 if new_sentence_prob > max_prob:
+                    max_prob = new_sentence_prob
                     max_sentence = new_sentence
         original_sentence_prob = self.calc_sentence_prob(text, math.log(alpha))
         if original_sentence_prob > max_prob:
-            max_sentence = text
-        return max_sentence
+            max_sentence = text.split(' ')
+        return ' '.join(max_sentence)
 
     def calc_sentence_prob(self, sentence, channel_prob):
-        prior_sentence_prob = self.lm.evaluate(sentence)
+        """
+        Calculate the probabily of given sentence to be generate with the noisy channel pros
+        :param sentence: sentence to calculate its prob
+        :param channel_prob: the prob of the changed word
+        :return: the log prob of the sentence
+        """
+        prior_sentence_prob = self.evaluate(sentence)
         return prior_sentence_prob + channel_prob
 
     def get_word_edits(self, word):
-        letters = 'abcdefghijklmnopqrstuvwxyz'
+        """
+        build all edits for a given word. whitespace is enabled to be suggested as correction by check if the two words that
+        it create are in vocabulary.
+        :param word: word to get its edits
+        :return: possible edits for given word. return only vocabulary edits.
+        """
+        letters = """abcdefghijklmnopqrstuvwxyz '"""
         splits = [(word[:i], word[i:]) for i in range(len(word) + 1)]
-        insertions = [[L + R[1:], self.calc_edit_prob('insertion', (L[-1] if L else '#') + R[0])] for L, R in splits if
-                      R]
-        transposes = [[L + R[1] + R[0] + R[2:], self.calc_edit_prob('transposition', R[0] + R[1])] for L, R in splits if
-                      len(R) > 1]
-        replaces = [[L + c + R[1:], self.calc_edit_prob('substitution', R[0] + c)] for L, R in splits if R for c in
+        insertions = [[L + R[1:], self.calc_edit_prob('insertion', (L[-1] if L else '#') + R[0], L[-1] if L else '#')]
+                      for L, R in splits if R]
+        transposes = [[L + R[1] + R[0] + R[2:], self.calc_edit_prob('transposition', R[1] + R[0], R[1] + R[0])] for L, R
+                      in splits if len(R) > 1]
+        replaces = [[L + c + R[1:], self.calc_edit_prob('substitution', R[0] + c, c)] for L, R in splits if R for c in
                     letters]
-        deletions = [[L + c + R, self.calc_edit_prob('deletion', (L[-1] if L else '#') + c)] for L, R in splits for c in
-                     letters]
-        return set(insertions + transposes + replaces + deletions)
+        deletions = [[L + c + R, self.calc_edit_prob('deletion', (L[-1] if L else '#') + c, (L[-1] if L else '#') + c)]
+                     for L, R in splits for c in letters]
+        edits = [[word, prob] for word, prob in (insertions + transposes + replaces + deletions) if
+                 all([w in self.vocabulary for w in word.split()])]
+        return self.edit_best_prob(edits)
 
-    def calc_edit_prob(self, err_type, err_letters):
-        pass
+    def calc_edit_prob(self, err_type, err_letters, letters_to_count):
+        """
+        Calculate the prob of edit to be the right edit. according to Kemighan 1990
+        :param err_type (str): one of 'insertion', 'deletion', 'substitution' or 'transposition'
+        :param err_letters (str): the letters that making the error
+        :param letters_to_count (str): the letter(s) we count to normalize err_letters
+        :return: the prob of edit to be the right edit
+        """
+        return (self.error_tables[err_type].get(err_letters, 0) + 1) / (self.count_table.get(letters_to_count, 0) + 1)
+
+    def edit_best_prob(self, edits):
+        """
+        For case that word has same edits, save onlu the one with the best prob because it will get bigger score anyway.
+        :param edits (list): edits of a word
+        :return: the edit with the best prob
+        """
+        best_edit_prob = {}
+        for edit, prob in edits:
+            if edit not in best_edit_prob:
+                best_edit_prob[edit] = prob
+            else:
+                if prob > best_edit_prob[edit]:
+                    best_edit_prob[edit] = prob
+        return [[edit, prob] for edit, prob in best_edit_prob.items()]
+
 
 def who_am_i():  # this is not a class method
     """Returns a ductionary with your name, id number and email. keys=['name', 'id','email']
@@ -194,7 +355,7 @@ class Ngram_Language_Model:
                     n_size_context[context] = {last_gram: 1}
                 if n == self.n:
                     self.model_dict[ngram] += 1
-        self.V = len(self.context_by_n[0][''])
+        self.V = len(self.context_by_n[self.n - 1])
         sum_per_context = [sum(self.context_by_n[self.n - 1][context].values()) for context in
                            self.context_by_n[self.n - 1]]
         sum_all_context = sum(sum_per_context)
